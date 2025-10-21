@@ -1,58 +1,74 @@
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.database import get_db
 from app.models.book import Book
-from app.ai.llama_client import llama_chat
-from pydantic import BaseModel
+from app.schemas.ai_schema import AIRequest
+import requests
 
 router = APIRouter(prefix="/ai", tags=["AI"])
 
-# Response schema for docs
-class AIResponse(BaseModel):
-    answer: str
 
-@router.post("/chat", response_model=AIResponse)
-async def chat(prompt: str = Body(..., embed=True)):
+def ask_llama(prompt: str) -> str:
     """
-    Basic chat endpoint with LLaMA.
+    Ask the local Ollama model via HTTP API (fast and local).
     """
-    answer = await llama_chat(prompt)
-    return {"answer": answer}
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3:latest",
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "").strip() or "No response from AI."
 
-@router.post("/recommend", response_model=AIResponse)
-async def recommend(
-    keyword: str = Body(..., embed=True),
-    db: AsyncSession = Depends(get_db)
-):
+    except requests.exceptions.Timeout:
+        return "Sorry, the AI took too long to respond."
+    except requests.exceptions.ConnectionError:
+        return "Could not connect to Ollama. Please ensure 'ollama serve' is running."
+    except Exception as e:
+        return f"Unexpected error: {e}"
+
+
+@router.post("/recommend")
+async def recommend_book(request: AIRequest, db: AsyncSession = Depends(get_db)):
     """
-    Recommend similar books based on the database and keyword/title.
+    Recommend only books that exist in the database,
+    but sound natural and conversational.
     """
-    # 1️⃣ Get all books from the DB
+    query = request.query.lower()
+
+    # Fetch all books
     result = await db.execute(select(Book))
     books = result.scalars().all()
 
     if not books:
-        raise HTTPException(status_code=404, detail="No books found in the database.")
+        return {"recommendation": "No books found in the database."}
 
-    # 2️⃣ Format books for AI
-    book_list = "\n".join(
-        [f"- {b.title} by {b.author}: {b.description or 'No description'}" for b in books]
+    # Build book list for the prompt
+    book_list = [
+        f"{book.title} by {book.author} (Genre: {book.genre})"
+        for book in books if book.title and book.author
+    ]
+
+    # Refined prompt: natural tone + strict rule
+    prompt = (
+        f"You are a friendly book advisor. You help users find books from our store.\n\n"
+        f"Here’s the list of ALL books available in the store (you CANNOT use anything else):\n"
+        f"{chr(10).join(book_list)}\n\n"
+        f"The user said: '{query}'\n\n"
+        f"Your job:\n"
+        f"- Pick one or more books ONLY from the list above.\n"
+        f"- Never invent books or mention authors not listed.\n"
+        f"- Speak like a human — friendly, short, and personal (2–3 sentences max).\n"
+        f"- If nothing fits, say: 'Sorry, I couldn’t find anything that matches your taste right now.'\n\n"
+        f"Now reply in a warm, natural way."
     )
 
-    # 3️⃣ Create the prompt for LLaMA
-    prompt = f"""
-You are an intelligent book recommendation AI.
-Below is the list of available books in our store:
-
-{book_list}
-
-The user is interested in: "{keyword}"
-
-From the above list, suggest 3 books that best match their interest.
-Explain each recommendation briefly and naturally.
-    """
-
-    # 4️⃣ Ask LLaMA
-    answer = await llama_chat(prompt)
-    return {"answer": answer}
+    ai_response = ask_llama(prompt)
+    return {"recommendation": ai_response}
