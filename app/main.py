@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from app.routes import users, books, ai, uploads, categories, admin_users
 from app.database import Base, engine
 from fastapi.staticfiles import StaticFiles
+from app.routes import admin_products
 import os
 
 
@@ -21,6 +22,7 @@ app.include_router(ai.router)
 app.include_router(uploads.router)
 app.include_router(categories.router)
 app.include_router(admin_users.router)
+app.include_router(admin_products.router)
 
 
 @app.on_event("startup")
